@@ -15,7 +15,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'super_secret_neon_key_fallback')
-APP_VERSION = "v1.1.0"
+APP_VERSION = "v1.1.1"
 
 DB_FILE = 'autopubli_v4.db'
 UPLOAD_FOLDER = 'uploads'
