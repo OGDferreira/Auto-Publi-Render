@@ -1,0 +1,139 @@
+{% extends 'layout.html' %}
+{% block content %}
+
+<div class="flex justify-between items-end mb-8">
+    <div>
+        <h1 class="text-4xl font-extrabold text-white">Pipeline de Mídia</h1>
+        <p class="text-cyan-400 font-medium mt-1 uppercase tracking-widest text-xs">Monitoramento em Tempo Real</p>
+    </div>
+</div>
+
+<div class="glass-panel rounded-3xl overflow-hidden border border-white/10">
+    <table class="w-full text-left border-collapse">
+        <thead>
+            <tr class="bg-black/40 text-slate-400 text-[10px] font-bold uppercase tracking-widest border-b border-white/10">
+                <th class="p-5 pl-6">Mídia & Info</th>
+                <th class="p-5">Destino</th>
+                <th class="p-5">Horário Alvo</th>
+                <th class="p-5">Status</th>
+                <th class="p-5 text-center">Inspecionar</th>
+            </tr>
+        </thead>
+        <tbody class="divide-y divide-white/5 text-sm">
+            {% for item in queue %}
+            <tr class="hover:bg-white/5 transition-colors group">
+                <td class="p-5 pl-6 flex items-center gap-4">
+                    <div class="w-12 h-12 rounded-xl shadow-lg flex items-center justify-center relative overflow-hidden bg-gradient-to-br from-slate-800 to-black border border-white/10">
+                        <i class="fa-solid {% if item.media_type == 'image' %}fa-image{% else %}fa-video{% endif %} text-white/30 text-lg group-hover:text-cyan-400 transition-colors"></i>
+                    </div>
+                    <div>
+                        <p class="font-bold text-white text-sm max-w-[200px] truncate" title="{{ item.original_filename }}">{{ item.original_filename }}</p>
+                        <p class="text-[10px] text-slate-500 font-bold uppercase tracking-widest mt-0.5">Pos: #{{ item.position }}</p>
+                    </div>
+                </td>
+                <td class="p-5"><span class="text-fuchsia-300 font-bold bg-fuchsia-500/10 px-3 py-1.5 rounded-lg border border-fuchsia-500/20">@{{ item.account_username }}</span></td>
+                <td class="p-5"><p class="text-white font-bold text-sm">{{ item.scheduled_time[11:16] }}</p><p class="text-[10px] text-slate-500 uppercase tracking-widest font-bold mt-0.5">{{ item.scheduled_time[0:10] }}</p></td>
+                <td class="p-5">
+                    {% if item.status == 'aguardando' %}<span class="px-3 py-1 rounded-md text-[10px] font-bold uppercase tracking-widest bg-yellow-500/10 text-yellow-400 border border-yellow-500/30"><i class="fa-solid fa-clock"></i> Aguardando</span>
+                    {% elif item.status == 'processando' %}<span class="px-3 py-1 rounded-md text-[10px] font-bold uppercase tracking-widest bg-blue-500/10 text-blue-400 border border-blue-500/30"><i class="fa-solid fa-spinner animate-spin"></i> Processando</span>
+                    {% elif item.status == 'publicado' %}<span class="px-3 py-1 rounded-md text-[10px] font-bold uppercase tracking-widest bg-emerald-500/10 text-emerald-400 border border-emerald-500/30"><i class="fa-solid fa-check"></i> Publicado</span>
+                    {% elif item.status == 'erro' %}<span class="px-3 py-1 rounded-md text-[10px] font-bold uppercase tracking-widest bg-red-500/10 text-red-400 border border-red-500/30"><i class="fa-solid fa-skull"></i> Falha</span>{% endif %}
+                </td>
+                <td class="p-5 text-center">
+                    <button onclick="openModal({{ item.id }})" class="w-10 h-10 rounded-xl bg-black/50 border border-white/10 text-slate-400 hover:text-cyan-400 hover:border-cyan-400/50 transition-all shadow-lg"><i class="fa-solid fa-eye"></i></button>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+
+<!-- MODAL COM PLAYER DE VÍDEO REAL -->
+<div id="modal-video" class="fixed inset-0 z-50 hidden bg-black/90 backdrop-blur-md flex items-center justify-center p-4 opacity-0 transition-opacity duration-300">
+    <div class="glass-panel w-full max-w-4xl rounded-[2rem] overflow-hidden border border-cyan-500/30 shadow-[0_0_50px_rgba(6,182,212,0.15)] transform scale-95 transition-transform duration-300 flex flex-col md:flex-row h-[600px]" id="modal-content">
+        
+        <!-- Player de Vídeo Real -->
+        <div class="w-full md:w-1/2 bg-black border-r border-white/10 flex flex-col justify-center items-center relative p-8">
+            <video id="m-video-player" controls autoplay class="w-full max-w-[280px] rounded-2xl shadow-[0_0_30px_rgba(0,0,0,0.8)] border border-white/10"></video>
+            <img id="m-image-player" alt="Pré-visualização da imagem" class="hidden w-full max-w-[280px] rounded-2xl shadow-[0_0_30px_rgba(0,0,0,0.8)] border border-white/10">
+        </div>
+
+        <div class="w-full md:w-1/2 p-8 flex flex-col overflow-y-auto bg-gradient-to-b from-white/[0.02] to-transparent relative">
+            <button onclick="closeModal()" class="absolute top-6 right-6 w-10 h-10 bg-white/5 hover:bg-red-500/20 border border-white/10 rounded-xl text-slate-400 hover:text-red-400 transition-all flex items-center justify-center"><i class="fa-solid fa-xmark"></i></button>
+            
+            <h3 id="m-filename" class="text-2xl font-black text-white pr-12 break-all"></h3>
+            <p class="text-xs font-bold text-cyan-400 tracking-widest mt-2 uppercase">Agendado: <span id="m-time" class="text-white"></span></p>
+
+            <div class="space-y-6 mt-8 flex-1">
+                <div id="m-error-area" class="hidden bg-red-950/40 border border-red-500/50 p-5 rounded-2xl">
+                    <p class="text-[10px] font-black text-red-400 uppercase tracking-widest mb-2">Log de Falha</p>
+                    <p id="m-error-msg" class="text-sm text-white font-medium"></p>
+                </div>
+
+                <div class="bg-black/40 border border-white/5 p-5 rounded-2xl">
+                    <p class="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-2">Destino / Target</p>
+                    <span id="m-account" class="text-white font-bold text-lg bg-white/5 px-3 py-1.5 rounded-lg border border-white/10"></span>
+                </div>
+
+                <div class="bg-black/40 border border-white/5 p-5 rounded-2xl">
+                    <p class="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-2">Legenda Carregada</p>
+                    <p id="m-caption" class="text-sm text-slate-300 whitespace-pre-wrap leading-relaxed max-h-32 overflow-y-auto"></p>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+    const queueData = {{ queue_json | safe }};
+
+    function openModal(id) {
+        const item = queueData.find(q => q.id === id);
+        
+        document.getElementById('m-filename').innerText = item.original_filename;
+        document.getElementById('m-time').innerText = item.scheduled_time;
+        document.getElementById('m-caption').innerText = item.caption || 'Sem legenda.';
+        document.getElementById('m-account').innerText = '@' + item.account_username;
+
+        const errArea = document.getElementById('m-error-area');
+        if(item.status === 'erro') {
+            errArea.classList.remove('hidden');
+            document.getElementById('m-error-msg').innerText = item.error_message;
+        } else {
+            errArea.classList.add('hidden');
+        }
+
+        // PRÉ-VISUALIZAÇÃO DO VÍDEO REAL:
+        // Passa o nome do arquivo gerado pelo backend (ex: vid_1_0_123.mp4) para o player
+        const player = document.getElementById('m-video-player');
+        const image = document.getElementById('m-image-player');
+        if (item.media_type === 'image') {
+            player.pause();
+            player.classList.add('hidden');
+            image.src = `/uploads/${item.filename}`;
+            image.classList.remove('hidden');
+        } else {
+            image.classList.add('hidden');
+            image.removeAttribute('src');
+            player.classList.remove('hidden');
+            player.src = `/uploads/${item.filename}`;
+        }
+
+        const modal = document.getElementById('modal-video');
+        const content = document.getElementById('modal-content');
+        modal.classList.remove('hidden');
+        setTimeout(() => { modal.classList.remove('opacity-0'); content.classList.remove('scale-95'); }, 10);
+    }
+
+    function closeModal() {
+        // Pausar o vídeo ao fechar
+        document.getElementById('m-video-player').pause();
+        
+        const modal = document.getElementById('modal-video');
+        const content = document.getElementById('modal-content');
+        modal.classList.add('opacity-0');
+        content.classList.add('scale-95');
+        setTimeout(() => modal.classList.add('hidden'), 300);
+    }
+</script>
+{% endblock %}
