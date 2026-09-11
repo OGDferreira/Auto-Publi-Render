@@ -2,8 +2,10 @@ import os
 import time
 import sqlite3
 import json
+import secrets
+from urllib.parse import urlencode
 from datetime import datetime, timedelta
-from flask import Flask, render_template, request, redirect, url_for, flash, send_from_directory, jsonify, has_request_context
+from flask import Flask, render_template, request, redirect, url_for, flash, send_from_directory, jsonify, has_request_context, session
 import requests
 import urllib3
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -29,17 +31,18 @@ WEBHOOK_VERIFY_TOKEN = os.environ.get('WEBHOOK_VERIFY_TOKEN', '')
 FUNNEL_LINK = "https://seu-link-de-vendas.com/oferta"
 PUBLIC_BASE_URL = (os.environ.get('PUBLIC_BASE_URL') or os.environ.get('RENDER_EXTERNAL_URL') or '').rstrip('/')
 
-# IMPORTANTE: seu app usa o fluxo clássico "Instagram Graph API via Facebook
-# Login" (escopos pages_show_list / instagram_basic / instagram_content_publish
-# / instagram_manage_messages / pages_read_engagement). Nesse fluxo, TODAS as
-# chamadas — OAuth, descoberta da conta do Instagram, publicação e mensagens —
-# são feitas contra graph.facebook.com, nunca graph.instagram.com (esse host é
-# de um produto diferente, "Instagram API with Instagram Login", que usa um
-# outro tipo de token e não entende tokens de usuário do Facebook). Foi essa
-# mistura de hosts que causava o erro "Cannot parse access token".
-GRAPH_API_VERSION = os.environ.get('GRAPH_API_VERSION', 'v20.0')
-GRAPH_URL = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
-OAUTH_SCOPES = "instagram_basic,instagram_content_publish,instagram_manage_messages,instagram_manage_comments,pages_show_list,pages_read_engagement"
+# Instagram API with Instagram Login (Business Login). Esse fluxo não usa
+# Página do Facebook nem tokens de Página.
+GRAPH_API_VERSION = os.environ.get('GRAPH_API_VERSION', 'v25.0')
+GRAPH_URL = f"https://graph.instagram.com/{GRAPH_API_VERSION}"
+INSTAGRAM_AUTHORIZE_URL = "https://www.instagram.com/oauth/authorize"
+INSTAGRAM_OAUTH_URL = "https://api.instagram.com/oauth"
+OAUTH_SCOPES = (
+    "instagram_business_basic,"
+    "instagram_business_content_publish,"
+    "instagram_business_manage_messages,"
+    "instagram_business_manage_comments"
+)
 
 # ==========================================
 # 1. BANCO DE DADOS
@@ -87,7 +90,7 @@ def inject_app_version():
     return {'APP_VERSION': APP_VERSION}
 
 # ==========================================
-# 2. HELPERS DE AUTENTICAÇÃO / DESCOBERTA (Graph API v20.0)
+# 2. HELPERS DE AUTENTICAÇÃO / DESCOBERTA (Instagram Graph API)
 # ==========================================
 def _friendly_meta_error(payload):
     """Extrai uma mensagem amigável de um erro padrão da Graph API."""
@@ -97,12 +100,11 @@ def _friendly_meta_error(payload):
     msg = err.get('message', 'Erro desconhecido ao falar com a Meta.')
 
     if code == 190:
-        return ("Token inválido, expirado ou mal formatado (erro 190). Gere um novo token no "
-                "Graph API Explorer selecionando seu App, ou refaça o login em /login_meta. "
+        return ("Token do Instagram inválido, expirado ou mal formatado (erro 190). "
+                "Refaça o login em /login_meta ou gere um token com as permissões do Instagram. "
                 f"Detalhe da Meta: {msg}")
     if subcode == 33 or code == 100:
-        return (f"A Meta não encontrou o recurso solicitado. Verifique se o usuário do token "
-                f"administra a Página e se ela está vinculada ao Instagram. Detalhe: {msg}")
+        return f"A Meta não encontrou o recurso solicitado no Instagram. Detalhe: {msg}"
     return f"Erro da Meta: {msg}"
 
 
@@ -114,11 +116,14 @@ def _get_json(response):
         return {'error': {'message': f'Resposta não-JSON da Meta (HTTP {response.status_code}).'}}
 
 
-def _get_instagram_profile(ig_user_id, access_token):
-    """Busca o perfil diretamente para não depender do objeto aninhado da Página."""
+def _get_instagram_profile(access_token):
+    """Busca o perfil do usuário do Instagram diretamente pelo token."""
     response = requests.get(
-        f"{GRAPH_URL}/{ig_user_id}",
-        params={'fields': 'id,username,name,profile_picture_url', 'access_token': access_token},
+        f"{GRAPH_URL}/me",
+        params={
+            'fields': 'user_id,username,name,profile_picture_url',
+            'access_token': access_token,
+        },
         timeout=20,
     )
     profile = _get_json(response)
@@ -126,12 +131,14 @@ def _get_instagram_profile(ig_user_id, access_token):
         return None, _friendly_meta_error(profile)
 
     username = (profile.get('username') or '').strip()
+    ig_user_id = str(profile.get('user_id') or profile.get('id') or '').strip()
     if not username:
-        return None, ("A Meta não retornou o username da conta do Instagram. "
-                      "Confirme que a Página está vinculada à conta comercial correta.")
+        return None, "A Meta não retornou o username da conta do Instagram."
+    if not ig_user_id:
+        return None, "A Meta não retornou o ID da conta do Instagram."
 
     return {
-        'id': profile.get('id') or ig_user_id,
+        'id': ig_user_id,
         'username': username,
         'name': (profile.get('name') or '').strip(),
         'profile_picture_url': (profile.get('profile_picture_url') or '').strip(),
@@ -140,19 +147,17 @@ def _get_instagram_profile(ig_user_id, access_token):
 
 def exchange_for_long_lived_token(short_token):
     """
-    Troca um token curto (ou até um token já de usuário do Graph Explorer) por um
-    token de longa duração (~60 dias) via fb_exchange_token.
+    Troca um token curto do Instagram por um token de longa duração (~60 dias).
     Retorna (token, erro). Se a troca falhar, devolve o token original como
     fallback (ele ainda pode funcionar por algumas horas) e o erro para log/flash.
     """
     try:
         params = {
-            'grant_type': 'fb_exchange_token',
-            'client_id': META_APP_ID,
+            'grant_type': 'ig_exchange_token',
             'client_secret': META_APP_SECRET,
-            'fb_exchange_token': short_token,
+            'access_token': short_token,
         }
-        r = requests.get(f"{GRAPH_URL}/oauth/access_token", params=params, timeout=20)
+        r = requests.get(f"{GRAPH_URL}/access_token", params=params, timeout=20)
         data = _get_json(r)
         if 'access_token' in data:
             return data['access_token'], None
@@ -165,76 +170,26 @@ def exchange_for_long_lived_token(short_token):
 
 def discover_instagram_accounts(user_access_token):
     """
-    Dado um token de USUÁRIO do Facebook (curto, longo, ou colado manualmente
-    do Graph Explorer), descobre todas as Páginas administradas por esse
-    usuário e, para cada uma, a Conta Comercial/Criador do Instagram vinculada.
-
-    Usa o Page Access Token (não o token de usuário) como access_token salvo,
-    pois é ele quem carrega as permissões instagram_content_publish /
-    instagram_manage_messages para aquela conta específica e tende a durar
-    mais tempo em produção.
-
-    Retorna (lista_de_contas, erro_amigavel_ou_None).
-    lista_de_contas = [{ig_user_id, username, name, page_id, access_token}]
+    Valida um token de usuário do Instagram e retorna o próprio perfil.
+    O nome da função é mantido para não alterar o contrato das rotas existentes.
     """
     if not user_access_token or not user_access_token.strip():
         return [], "Nenhum token foi informado."
 
     try:
-        params = {
-            'fields': 'id,name,access_token,instagram_business_account{id}',
+        profile, profile_error = _get_instagram_profile(user_access_token.strip())
+        if profile_error:
+            return [], profile_error
+        return [{
+            'ig_user_id': profile['id'],
+            'username': profile['username'],
+            'name': profile['name'] or profile['username'],
+            'profile_picture_url': profile['profile_picture_url'],
             'access_token': user_access_token.strip(),
-            'limit': 100,
-        }
-        r = requests.get(f"{GRAPH_URL}/me/accounts", params=params, timeout=20)
-        data = _get_json(r)
-
-        if 'error' in data:
-            return [], _friendly_meta_error(data)
-
-        pages = data.get('data', [])
-        if not pages:
-            return [], ("Nenhuma Página do Facebook foi encontrada para este token. Confirme que "
-                         "o token foi gerado com o escopo 'pages_show_list' e que o usuário "
-                         "administra ao menos uma Página conectada ao Instagram.")
-
-        contas = []
-        for page in pages:
-            ig_account = page.get('instagram_business_account')
-            if not ig_account or not ig_account.get('id'):
-                continue
-
-            page_access_token = page.get('access_token') or user_access_token.strip()
-            profile, profile_error = _get_instagram_profile(
-                ig_account['id'],
-                page_access_token,
-            )
-            if profile_error:
-                return [], profile_error
-
-            # O nome da Página é apenas um último recurso para contas sem nome
-            # público; username nunca deve ser substituído por um placeholder.
-            profile_name = profile['name'] or (page.get('name') or '').strip() or profile['username']
-            contas.append({
-                'ig_user_id': profile['id'],
-                'username': profile['username'],
-                'name': profile_name,
-                'profile_picture_url': profile['profile_picture_url'],
-                'page_id': page.get('id'),
-                # Page Access Token: é este que deve ser usado para publicar
-                # Reels e enviar/responder DMs nessa conta do Instagram.
-                'access_token': page_access_token,
-            })
-
-        if not contas:
-            return [], ("Encontramos suas Páginas do Facebook, mas nenhuma delas está vinculada a "
-                         "uma conta comercial ou de criador do Instagram. Vincule o Instagram à "
-                         "Página em Configurações da Página > Instagram, e tente novamente.")
-
-        return contas, None
+        }], None
 
     except requests.exceptions.Timeout:
-        return [], "Tempo esgotado ao contatar a Meta (/me/accounts). Tente novamente em instantes."
+        return [], "Tempo esgotado ao contatar a API do Instagram. Tente novamente em instantes."
     except requests.exceptions.RequestException as e:
         return [], f"Erro de conexão com a Meta: {e}"
 
@@ -273,26 +228,33 @@ def salvar_contas_descobertas(contas, apelido_manual=None):
 # ==========================================
 @app.route('/login_meta')
 def login_meta():
-    """Redireciona o usuário para a tela oficial de login da Meta"""
+    """Redireciona o usuário para o Business Login do Instagram."""
     if not META_APP_ID:
         flash("META_APP_ID não configurado nas variáveis de ambiente do Render.", "error")
         return redirect(url_for('contas'))
     redirect_uri = url_for('meta_callback', _external=True, _scheme='https')
-    url = (
-        f"https://www.facebook.com/{GRAPH_API_VERSION}/dialog/oauth"
-        f"?client_id={META_APP_ID}"
-        f"&redirect_uri={redirect_uri}"
-        f"&scope={OAUTH_SCOPES}"
-        f"&response_type=code"
-    )
+    oauth_state = secrets.token_urlsafe(32)
+    session['meta_oauth_state'] = oauth_state
+    url = f"{INSTAGRAM_AUTHORIZE_URL}?{urlencode({
+        'client_id': META_APP_ID,
+        'redirect_uri': redirect_uri,
+        'scope': OAUTH_SCOPES,
+        'response_type': 'code',
+        'state': oauth_state,
+    })}"
     return redirect(url)
 
 
 @app.route('/callback')
 def meta_callback():
-    """Recebe o code da Meta, troca por token de 60 dias e descobre a(s) conta(s) do Instagram"""
+    """Troca o código do Instagram por token e sincroniza o perfil autorizado."""
     code = request.args.get('code')
     error = request.args.get('error_description') or request.args.get('error')
+    callback_state = request.args.get('state')
+    expected_state = session.pop('meta_oauth_state', None)
+    if not expected_state or not callback_state or not secrets.compare_digest(expected_state, callback_state):
+        flash("Não foi possível validar a sessão de login do Instagram. Tente novamente.", "error")
+        return redirect(url_for('contas'))
     if error:
         flash(f"Conexão cancelada ou negada pela Meta: {error}", "error")
         return redirect(url_for('contas'))
@@ -303,14 +265,15 @@ def meta_callback():
     redirect_uri = url_for('meta_callback', _external=True, _scheme='https')
 
     try:
-        # 1. Troca o code pelo token curto
+        # 1. Troca o código por um token curto do Instagram.
         params = {
             'client_id': META_APP_ID,
             'redirect_uri': redirect_uri,
             'client_secret': META_APP_SECRET,
+            'grant_type': 'authorization_code',
             'code': code,
         }
-        r = requests.get(f"{GRAPH_URL}/oauth/access_token", params=params, timeout=20)
+        r = requests.post(f"{INSTAGRAM_OAUTH_URL}/access_token", data=params, timeout=20)
         res = _get_json(r)
         short_token = res.get('access_token')
 
@@ -325,7 +288,7 @@ def meta_callback():
             flash(f"Aviso: não foi possível estender o token para 60 dias ({exchange_error}). "
                   f"Usando token de curta duração por enquanto.", "error")
 
-        # 3. Descobre as Páginas do usuário e as contas do Instagram vinculadas
+        # 3. O token já representa a conta autorizada; /me retorna seus dados.
         contas, discover_error = discover_instagram_accounts(long_token)
         if discover_error:
             flash(f"Login na Meta funcionou, mas falhou ao localizar sua conta do Instagram: {discover_error}", "error")
@@ -612,14 +575,11 @@ def automacoes():
 @app.route('/contas/automatizar', methods=['POST'])
 def automatizar_conta():
     """
-    Inserção manual de token (ex: colado do Graph API Explorer).
+    Inserção manual de token de usuário do Instagram.
     Fluxo:
-      1. Tenta estender o token para longa duração (fb_exchange_token).
-      2. Usa /me/accounts para achar as Páginas do usuário e suas contas do
-         Instagram vinculadas (isso é o que estava faltando: chamar
-         graph.instagram.com/me diretamente nunca funciona com um token de
-         usuário do Facebook).
-      3. Salva o Page Access Token de cada conta encontrada.
+      1. Tenta estender o token para longa duração (ig_exchange_token).
+      2. Obtém o perfil da conta diretamente em graph.instagram.com/me.
+      3. Salva o token de usuário do Instagram para as chamadas futuras.
     """
     token = (request.form.get('access_token') or '').strip()
     apelido = request.form.get('name', '').strip() or None
